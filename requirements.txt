@@ -1,0 +1,9 @@
+langchain_cohere==0.5.1
+langchain_core==1.4.0
+langchain_groq==1.1.2
+postgrest==2.30.0
+python-dotenv==1.2.2
+streamlit==1.57.0
+supabase==2.30.0
+transformers==5.8.0
+unstructured==0.22.28
