@@ -2,7 +2,10 @@ import time
 import random
 from unstructured.partition.pdf import partition_pdf
 import os
-from unstructured.chunking.title import chunk_by_title
+# from unstructured.chunking.title import chunk_by_title
+# Replaced chunk_by_title with LangChain's Markdown splitter
+from langchain_text_splitters import MarkdownHeaderTextSplitter
+
 from langchain_core.documents import Document
 from models import *
 from supabase import create_client, Client
@@ -24,37 +27,117 @@ def partition_document(file_path: str, file_name: str):
     print(f"✅ Successfully partitioned into {len(partitioned_pdf)} parts")
     return partitioned_pdf
 
+# def create_chunks(elements):
+#     print(f"🔄 Started Chunking for partitioned parts")
+#
+#     chunks_list = chunk_by_title(
+#         elements=elements,
+#         combine_text_under_n_chars=500,
+#         max_characters=2000,
+#         new_after_n_chars=1500,
+#         overlap=200
+#     )
+#
+#     print(f"✅ Successfully chunked into {len(chunks_list)} parts")
+#     return chunks_list
+#
+# def process_chunk_list(chunk_list):
+#     print(f"🔄 Started Processing for chunk list")
+#
+#     langchain_documents: list[Document] = []
+#     for chunk in chunk_list:
+#         #In future when we deal with images & tables it will be tackled here
+#         separated_content = {
+#             'text': chunk.text,
+#         }
+#
+#         summarised_chunk = separated_content['text']
+#         metadata = {
+#             'raw_text': separated_content['text'],
+#         }
+#
+#         doc = Document(
+#             summarised_chunk,
+#             metadata=metadata,
+#         )
+#         langchain_documents.append(doc)
+#
+#     print(f"✅ Successfully processed {len(langchain_documents)} langchain documents")
+#     return langchain_documents
+#
+# def generate_embeddings(langchain_documents):
+#     print(f"🔄 Started Embedding process for chunk list")
+#     embedding_model = get_embedding_model()
+#
+#     texts = [
+#         doc.page_content
+#         for doc in langchain_documents
+#     ]
+#
+#     embeddings = embedding_model.embed_documents(texts)
+#
+#     embedded_documents = []
+#
+#     for doc, embedding in zip(langchain_documents,embeddings):
+#         embedded_documents.append({
+#             "content": doc.page_content,
+#             "metadata": doc.metadata,
+#             "embedding": embedding
+#         })
+#
+#     print(f"✅ Successfully embedded {len(embedded_documents)} documents")
+#     return embedded_documents
+
 def create_chunks(elements):
     print(f"🔄 Started Chunking for partitioned parts")
 
-    chunks_list = chunk_by_title(
-        elements=elements,
-        combine_text_under_n_chars=500,
-        max_characters=2000,
-        new_after_n_chars=1500,
-        overlap=200
+    # 1. Bridge unstructured elements to a Markdown string
+    markdown_text = ""
+    for el in elements:
+        # If unstructured identifies the text as a Title, format it as a Markdown header
+        if hasattr(el, 'category') and el.category == 'Title':
+            markdown_text += f"## {el.text}\n\n"
+        else:
+            markdown_text += f"{el.text}\n\n"
+
+    # 2. Define which headers we want LangChain to split on
+    headers_to_split_on = [
+        ("#", "Header 1"),
+        ("##", "Header 2"),
+        ("###", "Header 3"),
+    ]
+
+    # 3. Initialize the splitter
+    markdown_splitter = MarkdownHeaderTextSplitter(
+        headers_to_split_on=headers_to_split_on,
+        strip_headers=False # Keeps the header text inside the chunk for context
     )
+
+    # 4. Split the text (This returns a list of LangChain Document objects)
+    chunks_list = markdown_splitter.split_text(markdown_text)
 
     print(f"✅ Successfully chunked into {len(chunks_list)} parts")
     return chunks_list
+
 
 def process_chunk_list(chunk_list):
     print(f"🔄 Started Processing for chunk list")
 
     langchain_documents: list[Document] = []
     for chunk in chunk_list:
-        #In future when we deal with images & tables it will be tackled here
+        # chunk is now a LangChain Document, so we use .page_content instead of .text
         separated_content = {
-            'text': chunk.text,
+            'text': chunk.page_content,
         }
 
         summarised_chunk = separated_content['text']
-        metadata = {
-            'raw_text': separated_content['text'],
-        }
+
+        # We merge LangChain's header metadata with your custom metadata
+        metadata = chunk.metadata.copy() if chunk.metadata else {}
+        metadata['raw_text'] = separated_content['text']
 
         doc = Document(
-            summarised_chunk,
+            page_content=summarised_chunk,  # Document uses page_content, not the positional argument
             metadata=metadata,
         )
         langchain_documents.append(doc)

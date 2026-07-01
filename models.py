@@ -1,7 +1,21 @@
 from langchain_cohere import CohereEmbeddings
 from dotenv import load_dotenv
 from langchain_groq import ChatGroq
+from pydantic import BaseModel, Field
+from typing import List
+
 load_dotenv()
+
+
+class DecomposedQueries(BaseModel):
+    """Strict schema for LLM-generated query decomposition. Used with json.loads() +
+    DecomposedQueries(**data) so the open-source model's output is validated, not trusted blindly."""
+    queries: List[str] = Field(
+        ...,
+        min_length=3,
+        max_length=3,
+        description="Exactly 3 alternative search queries capturing different semantic angles of the original question.",
+    )
 
 def get_embedding_model():
 

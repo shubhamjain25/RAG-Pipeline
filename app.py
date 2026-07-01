@@ -1,8 +1,11 @@
 import streamlit as st
 import time
+import uuid
 import tempfile
 from process import process_document
-from respond import query_rag
+from respond import query_rag_stream
+from conversation_log import generate_conversation_id, new_log_entry
+from rag_config import HISTORY_TURNS_TO_INCLUDE, HISTORY_MESSAGE_CHAR_LIMIT
 import traceback
 import os
 import logging
@@ -140,6 +143,32 @@ st.markdown(
     .stage-icon    { font-size:2rem; line-height:1; }
     .stage-label   { font-size:0.78rem; font-weight:600; text-align:center; line-height:1.4; }
     .stage-sep     { font-size:1.4rem; color:#252540; padding:0 4px; user-select:none; }
+
+    /* ── Source chunk cards ───────────────────────────────────────── */
+    .chunk-card {
+        background:#1e3a5f;
+        border-left: 4px solid #4a9eff;
+        border-radius: 6px;
+        padding: 12px 16px;
+        margin-bottom: 10px;
+        color: #d6e8ff;
+        font-size: 0.88rem;
+        line-height: 1.55;
+    }
+    .chunk-card strong { color:#7ec8ff; }
+
+    /* ── Deep-think badge / subtle prompt ────────────────────────── */
+    .deep-think-badge {
+        display: inline-block;
+        background: #2a1f4d;
+        color: #b9a4ff;
+        border-radius: 6px;
+        padding: 2px 10px;
+        font-size: 0.75rem;
+        font-weight: 600;
+        margin-bottom: 8px;
+    }
+    div[data-testid="stCaptionContainer"] { opacity: 0.75; }
     </style>
     """,
     unsafe_allow_html=True,
@@ -152,9 +181,126 @@ for key, default in {
     "pdf_path": None,
     "doc_id": None,
     "messages": [],
+    "conversation_id": None,
+    "conversation_log": [],
+    "pending_deep_think": None,  # holds the question text awaiting a deep-think rerun
 }.items():
     if key not in st.session_state:
         st.session_state[key] = default
+
+if st.session_state.conversation_id is None:
+    st.session_state.conversation_id = generate_conversation_id()
+
+
+# ── Shared turn-processing helper (used for both standard & deep-think turns) ──
+def _format_history() -> str:
+    """
+    Formats the last HISTORY_TURNS_TO_INCLUDE user/assistant pairs from
+    st.session_state.messages into plain text for the condensation + answer
+    prompts. Each message is truncated to HISTORY_MESSAGE_CHAR_LIMIT chars so
+    one long "deep think" answer can't dominate the next turn's prompt budget.
+    """
+    history_msgs = st.session_state.messages[-(HISTORY_TURNS_TO_INCLUDE * 2):]
+    if not history_msgs:
+        return ""
+
+    lines = []
+    for msg in history_msgs:
+        role = "User" if msg["role"] == "user" else "Assistant"
+        content = msg["content"][:HISTORY_MESSAGE_CHAR_LIMIT]
+        lines.append(f"{role}: {content}")
+    return "\n".join(lines)
+
+
+def _run_turn(question: str, deep_think: bool, history_text: str = ""):
+    """Runs retrieval+generation for one turn, streams the answer, logs it, and
+    appends the resulting assistant message to session state."""
+    spinner_text = "🧠 Thinking deeply…" if deep_think else "Thinking…"
+
+    with st.chat_message("assistant"):
+        with st.spinner(spinner_text):
+            metadata, stream_gen = query_rag_stream(
+                question=question,
+                document_id=st.session_state.doc_id,
+                deep_think=deep_think,
+                history_text=history_text,
+            )
+        start = time.time()
+        if deep_think:
+            st.markdown('<span class="deep-think-badge">🧠 Deep think</span>', unsafe_allow_html=True)
+        full_answer = st.write_stream(stream_gen)
+        latency_ms = int((time.time() - start) * 1000)
+
+        chunks = metadata.get("chunks", []) or []
+        if chunks:
+            with st.expander("📚 Source passages", expanded=False):
+                for i, chunk in enumerate(chunks, 1):
+                    st.markdown(
+                        f"""<div class="chunk-card"><strong>Chunk {i}</strong><br>{chunk.get("content", "")}</div>""",
+                        unsafe_allow_html=True,
+                    )
+
+        msg_id = uuid.uuid4().hex
+        allow_deep_think = (not deep_think) and bool(chunks)
+        if allow_deep_think:
+            st.caption("Not satisfied? 🧠 think deeper ↓ (see button below)")
+
+    # Persist to chat history
+    st.session_state.messages.append({
+        "role": "assistant",
+        "content": full_answer,
+        "chunks": chunks,
+        "deep_think": deep_think,
+        "allow_deep_think": allow_deep_think,
+        "msg_id": msg_id,
+        "question": question,
+    })
+
+    # Persist to conversation log
+    log_entry = new_log_entry(
+        conversation_id=st.session_state.conversation_id,
+        document_id=st.session_state.doc_id,
+        question=question,
+        metadata=metadata,
+        latency_ms=latency_ms,
+    )
+    st.session_state.conversation_log.append(log_entry)
+
+
+@st.dialog("📜 Conversation Log", width="large")
+def _show_conversation_log():
+    st.caption(f"Conversation ID: `{st.session_state.conversation_id}`")
+    if not st.session_state.conversation_log:
+        st.info("No turns logged yet for this conversation.")
+        return
+
+    for entry in reversed(st.session_state.conversation_log):
+        title = f"{entry['timestamp']} — {'🧠 Deep think' if entry['deep_think'] else 'Standard'}"
+        with st.expander(title, expanded=False):
+            st.markdown(f"**User message:** {entry['user_message']}")
+            if entry.get("standalone_question") and entry["standalone_question"] != entry["user_message"]:
+                st.markdown(f"**Condensed for retrieval:** {entry['standalone_question']}")
+            st.markdown(f"**Mode:** {entry['decomposition_mode'] or 'single_query'}")
+            if len(entry["queries_used"]) > 1:
+                st.markdown("**Queries used:**")
+                for q in entry["queries_used"]:
+                    st.markdown(f"- {q}")
+            st.markdown("**Retrieved chunks:**")
+            for c in entry["retrieved_chunks"]:
+                sim = c.get("similarity")
+                sim_str = f" (similarity: {sim:.3f})" if isinstance(sim, (int, float)) else ""
+                st.markdown(f"- `id={c.get('id')}`{sim_str}: {str(c.get('content', ''))[:200]}…")
+            st.markdown("**LLM answer:**")
+            st.markdown(entry["llm_answer"])
+            tok = entry.get("token_usage") or {}
+            st.markdown(
+                f"**Token usage:** input={tok.get('input_tokens')}, "
+                f"output={tok.get('output_tokens')}, total={tok.get('total_tokens')}"
+            )
+            st.markdown(f"**Latency:** {entry['latency_ms']} ms")
+            if entry.get("error"):
+                st.error(f"Error: {entry['error']}")
+
 
 # ══════════════════════════════════════════════════════════════════════════════
 # STAGE 1 — Upload
@@ -188,7 +334,7 @@ if st.session_state.stage == "upload":
         st.rerun()
 
 # ══════════════════════════════════════════════════════════════════════════════
-# STAGE 2 — Processing (5-second placeholder)
+# STAGE 2 — Processing
 # ══════════════════════════════════════════════════════════════════════════════
 elif st.session_state.stage == "processing":
 
@@ -205,13 +351,10 @@ elif st.session_state.stage == "processing":
                 break
             pipeline_slot.markdown(_pipeline_html(stage), unsafe_allow_html=True)
     except Exception as e:
-
         st.error(f"Processing failed: {e}")
         st.code(traceback.format_exc())
 
-
     if success:
-        # Briefly show all stages green before transitioning
         pipeline_slot.markdown(_pipeline_html("", all_done=True), unsafe_allow_html=True)
         time.sleep(0.6)
         st.session_state.stage = "done"
@@ -251,7 +394,7 @@ elif st.session_state.stage == "done":
 elif st.session_state.stage == "chat":
 
     # ── Header ────────────────────────────────────────────────────────────────
-    col_title, col_btn = st.columns([5, 1])
+    col_title, col_eye, col_btn = st.columns([4, 1, 1.3])
     with col_title:
         st.markdown(
             f"""
@@ -262,13 +405,19 @@ elif st.session_state.stage == "chat":
             """,
             unsafe_allow_html=True,
         )
+    with col_eye:
+        if st.button("👁️", help="View conversation log", use_container_width=True):
+            _show_conversation_log()
     with col_btn:
         if st.button("↩ New doc", use_container_width=True):
-            st.session_state.stage    = "upload"
-            st.session_state.pdf_name = None
-            st.session_state.pdf_path = None
-            st.session_state.doc_id   = None
-            st.session_state.messages = []
+            st.session_state.stage             = "upload"
+            st.session_state.pdf_name           = None
+            st.session_state.pdf_path           = None
+            st.session_state.doc_id             = None
+            st.session_state.messages           = []
+            st.session_state.conversation_id    = generate_conversation_id()
+            st.session_state.conversation_log   = []
+            st.session_state.pending_deep_think = None
             st.rerun()
 
     st.divider()
@@ -276,44 +425,38 @@ elif st.session_state.stage == "chat":
     # ── Render conversation history ────────────────────────────────────────────
     for msg in st.session_state.messages:
         with st.chat_message(msg["role"]):
+            if msg["role"] == "assistant" and msg.get("deep_think"):
+                st.markdown('<span class="deep-think-badge">🧠 Deep think</span>', unsafe_allow_html=True)
             st.markdown(msg["content"])
+
+            if msg["role"] == "assistant" and msg.get("chunks"):
+                with st.expander("📚 Source passages", expanded=False):
+                    for i, chunk in enumerate(msg["chunks"], 1):
+                        st.markdown(
+                            f"""<div class="chunk-card"><strong>Chunk {i}</strong><br>{chunk.get("content", "")}</div>""",
+                            unsafe_allow_html=True,
+                        )
+
+            if msg["role"] == "assistant" and msg.get("allow_deep_think"):
+                st.caption("Not satisfied with this answer?")
+                if st.button("🧠 Think deeper", key=f"deep_{msg['msg_id']}"):
+                    st.session_state.pending_deep_think = msg["question"]
+                    st.rerun()
+
+    # ── Handle a pending "think deeper" request ─────────────────────────────────
+    if st.session_state.pending_deep_think:
+        question = st.session_state.pending_deep_think
+        st.session_state.pending_deep_think = None
+        history_text = _format_history()
+        _run_turn(question, deep_think=True, history_text=history_text)
+        st.rerun()
 
     # ── Chat input ─────────────────────────────────────────────────────────────
     if prompt := st.chat_input("Ask something about your document…"):
-
-        # Show user message
+        history_text = _format_history()  # captured BEFORE appending current message
         st.session_state.messages.append({"role": "user", "content": prompt})
         with st.chat_message("user"):
             st.markdown(prompt)
 
-        # Generate and stream assistant response
-        with st.chat_message("assistant"):
-            with st.spinner("Thinking…"):
-                response = query_rag(question=prompt,document_id=st.session_state.doc_id)
-            st.markdown(response['answer'])
-
-            # ── Source chunks ──────────────────────────────────────────────
-            if response['chunks']:
-                with st.expander("📚 Source passages", expanded=False):
-                    for i, chunk in enumerate(response['chunks'], 1):
-                        st.markdown(
-                            f"""
-                            <div style="
-                                background:#1e3a5f;
-                                border-left: 4px solid #4a9eff;
-                                border-radius: 6px;
-                                padding: 12px 16px;
-                                margin-bottom: 10px;
-                                color: #d6e8ff;
-                                font-size: 0.88rem;
-                                line-height: 1.55;
-                            ">
-                                <strong style="color:#7ec8ff;">Chunk {i}</strong><br>{chunk}
-                            </div>
-                            """,
-                            unsafe_allow_html=True,
-                        )
-
-        st.session_state.messages.append(
-            {"role": "assistant", "content": response['answer']}
-        )
+        _run_turn(prompt, deep_think=False, history_text=history_text)
+        st.rerun()
